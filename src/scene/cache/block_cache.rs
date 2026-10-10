@@ -29,6 +29,19 @@ use crate::scene::model::wire_model::{
 };
 
 const MAX_NESTING_DEPTH: usize = 32;
+/// Total number of primitive wires a single top-level INSERT may expand into
+/// before the builder stops and reports it. `MAX_NESTING_DEPTH` bounds how
+/// *deep* a nesting tree may be, but a wide-and-shallow tree (one block
+/// holding >1k nested INSERTs, thousands of definitions referencing each
+/// other) passes it and can still expand to millions of primitives — ~600 B
+/// of `WireModel` each plus their heap allocations. The wire assembly is
+/// deliberately un-culled and LOD-free across the whole view (see
+/// `resident_wire_key`), so nothing else on that path bounds the count; this
+/// budget is what keeps a pathological drawing from exhausting memory.
+/// The limit is generous relative to any real drawing (the reported case
+/// expanded to 6.1 M) and is only reached when the assembly *cannot* be
+/// bounded by zoom-independent decisions.
+pub const MAX_EXPANDED_WIRES: usize = 4_000_000;
 /// Small line-only nested definitions cost more as separate instance records
 /// than as part of their parent's existing style batches. Folding these tiny
 /// subtrees at expansion time keeps exact geometry while avoiding one
@@ -40,6 +53,25 @@ const INLINE_NESTED_POINT_BUDGET: usize = 128;
 /// to the final image. Two pixels is a practical small-element floor:
 /// — visibly the same image, dramatically fewer wires.
 const MIN_PIXEL_SIZE: f32 = 2.0;
+
+/// Total-expansion budget truncated at least one block expansion since the
+/// last drain. Set from the (parallel, `&self`-only) tessellation path, which
+/// has no handle on the command line; the app drains it and reports once so
+/// the user is told geometry was omitted rather than silently drawing less.
+static EXPANSION_TRUNCATED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Record that a block expansion hit the total-expansion budget. Called once
+/// per truncated top-level INSERT; cheap and lock-free.
+pub fn note_expansion_truncated() {
+    EXPANSION_TRUNCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Take (and reset) the number of block expansions truncated since the last
+/// call. The app drains this once per open/rebuild to emit one warning.
+pub fn take_expansion_truncated() -> usize {
+    EXPANSION_TRUNCATED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone, Debug)]
 pub struct LocalWire {
@@ -1055,6 +1087,66 @@ pub fn expand_insert(
     // metadata, not visible geometry; nested POINTs remain regular block data.
     suppress_root_points: bool,
 ) -> Option<Vec<WireModel>> {
+    expand_insert_budgeted(
+        doc,
+        cache,
+        ins,
+        ins_handle,
+        ins_resolved_color,
+        ins_aci,
+        ins_pat_len,
+        ins_pat,
+        ins_lw_px,
+        ins_layer,
+        ins_layer_aci,
+        ins_layer_plottable,
+        selected,
+        pslt_factor,
+        view_aabb,
+        world_per_pixel,
+        is_xref,
+        bg_color,
+        anno_scale,
+        scale_policy,
+        suppress_root_points,
+    )
+    .map(|expanded| expanded.wires)
+}
+
+/// The result of one top-level INSERT expansion, carrying whether the shared
+/// total-expansion budget cut the geometry short (see [`MAX_EXPANDED_WIRES`]).
+pub struct ExpandedInsert {
+    pub wires: Vec<WireModel>,
+    pub truncated: bool,
+}
+
+/// [`expand_insert`], but reporting whether the total-expansion budget was hit
+/// so the caller can surface "geometry omitted" instead of silently drawing
+/// less.
+#[allow(clippy::too_many_arguments)]
+pub fn expand_insert_budgeted(
+    doc: &CadDocument,
+    cache: &BlockCache,
+    ins: &codec::entities::Insert,
+    ins_handle: Handle,
+    ins_resolved_color: [f32; 4],
+    ins_aci: u8,
+    ins_pat_len: f32,
+    ins_pat: [f32; 8],
+    ins_lw_px: f32,
+    ins_layer: crate::scene::view::render::InheritStyle,
+    ins_layer_aci: u8,
+    ins_layer_plottable: bool,
+    selected: bool,
+    pslt_factor: f32,
+    view_aabb: Option<[f32; 4]>,
+    world_per_pixel: Option<f32>,
+    is_xref: bool,
+    bg_color: [f32; 4],
+    anno_scale: f32,
+    scale_policy: crate::scene::BlockScalePolicy,
+    suppress_root_points: bool,
+) -> Option<ExpandedInsert> {
     let defn = cache.defn(&ins.block_name)?;
     let xform = crate::scene::render_graph::insert_transform_with_policy(
         doc,
@@ -1110,14 +1202,20 @@ pub fn expand_insert(
             translation[1] - cached.translation[1],
             translation[2] - cached.translation[2],
         ];
-        return Some(
-            cached
+        return Some(ExpandedInsert {
+            wires: cached
                 .wires
                 .iter()
                 .map(|wire| translated_prototype_wire(wire, &name, delta))
                 .collect(),
-        );
+            // A cached prototype was itself produced under the budget; a later
+            // truncated build never populates the cache, so a hit is complete.
+            truncated: false,
+        });
     }
+    // One budget per top-level expansion: bounds the total primitives a single
+    // INSERT can produce across all its nested references and array cells.
+    let budget = ExpansionBudget::new(MAX_EXPANDED_WIRES);
     let mut batches = Batches::default();
     let mut visited: Vec<String> = Vec::with_capacity(8);
 
@@ -1147,14 +1245,20 @@ pub fn expand_insert(
     // Whole-Insert frustum cull.
     if let Some(view) = view_aabb {
         if aabb_disjoint_xy(insert_local, view) {
-            return Some(vec![]);
+            return Some(ExpandedInsert {
+                wires: vec![],
+                truncated: false,
+            });
         }
     }
     // Whole-Insert pixel-size LOD: if the entire Insert footprint projects
     // to sub-pixel size, skip it entirely.
     if let Some(wpp) = world_per_pixel {
         if !defn.metrics.has_point_marker && aabb_pixel_size(insert_local, wpp) < MIN_PIXEL_SIZE {
-            return Some(vec![]);
+            return Some(ExpandedInsert {
+                wires: vec![],
+                truncated: false,
+            });
         }
     }
 
@@ -1171,10 +1275,20 @@ pub fn expand_insert(
         plot_visible: ins_layer_plottable,
         selected,
         pslt_factor,
-        view_aabb: None,
-        world_per_pixel: None,
+        // Forward the caller's cull/LOD inputs into the recursive walk so the
+        // existing view-AABB and sub-pixel gates inside `expand_defn` actually
+        // run. Passing `None` here (as this once did) left every
+        // `if let Some(view) = ctx.view_aabb` / `if let Some(wpp) =
+        // ctx.world_per_pixel` dead on every production call, which is why a
+        // wide nesting tree expanded unbounded. The resident open path now
+        // supplies a document-extent reference wpp (see
+        // `resident_reference_world_per_pixel`) so those gates bound it too,
+        // with the total-expansion budget as the backstop.
+        view_aabb,
+        world_per_pixel,
         is_xref,
         bg_color,
+        budget: &budget,
     };
     if offsets.len() > 1 {
         let first_xform = cell_xform(&offsets[0]);
@@ -1190,6 +1304,9 @@ pub fn expand_insert(
             suppress_root_points,
             (0.0, 1.0),
         );
+        if first_batches.truncated {
+            batches.truncated = true;
+        }
         let mut first = first_batches.finalize(&name, selected, bg_color);
         for wire in &mut first {
             if !is_standalone_analytical_curve(wire) && wire.render_instance.is_none() {
@@ -1203,20 +1320,35 @@ pub fn expand_insert(
         }
         let mut result = first.clone();
         for offset in offsets.iter().skip(1) {
+            if budget.exhausted() {
+                batches.truncated = true;
+                break;
+            }
             let translation = transform_translation(&cell_xform(offset));
             let delta = [
                 translation[0] - first_translation[0],
                 translation[1] - first_translation[1],
                 translation[2] - first_translation[2],
             ];
+            if !budget.charge_by(first.len()) {
+                batches.truncated = true;
+                break;
+            }
             result.extend(first.iter().map(|wire| {
                 translated_prototype_wire(wire, &name, delta)
             }));
         }
-        return Some(result);
+        return Some(ExpandedInsert {
+            wires: result,
+            truncated: batches.truncated,
+        });
     }
 
     for offset in &offsets {
+        if budget.exhausted() {
+            batches.truncated = true;
+            break;
+        }
         let base_xform = cell_xform(offset);
         expand_defn(
             defn,
@@ -1229,24 +1361,32 @@ pub fn expand_insert(
             (0.0, 1.0),
         );
     }
+    let truncated = batches.truncated;
+    if truncated {
+        note_expansion_truncated();
+    }
     let mut wires = batches.finalize(&name, selected, bg_color);
     if let Some(guard) = prototype_guard.as_mut() {
-        let translation = transform_translation(&xform);
-        for wire in &mut wires {
-            if !is_standalone_analytical_curve(wire) && wire.render_instance.is_none() {
-                wire.render_instance = Some(crate::scene::model::instance_model::RenderInstance {
-                    source_id: crate::scene::model::instance_model::next_source_id(),
-                    translation,
-                });
+        // A truncated expansion is not a faithful prototype — caching it would
+        // hand the same partial geometry to every later instance.
+        if !truncated {
+            let translation = transform_translation(&xform);
+            for wire in &mut wires {
+                if !is_standalone_analytical_curve(wire) && wire.render_instance.is_none() {
+                    wire.render_instance = Some(crate::scene::model::instance_model::RenderInstance {
+                        source_id: crate::scene::model::instance_model::next_source_id(),
+                        translation,
+                    });
+                }
             }
+            let cached = Arc::new(CachedExpansion {
+                translation,
+                wires: Arc::new(wires.clone()),
+            });
+            **guard = Some(cached);
         }
-        let cached = Arc::new(CachedExpansion {
-            translation,
-            wires: Arc::new(wires.clone()),
-        });
-        **guard = Some(cached);
     }
-    Some(wires)
+    Some(ExpandedInsert { wires, truncated })
 }
 
 fn transform_translation(transform: &Transform) -> [f64; 3] {
@@ -1435,6 +1575,53 @@ struct ExpandCtx<'a> {
     // which geometry comes from an external reference.
     is_xref: bool,
     bg_color: [f32; 4],
+    /// Total-expansion budget shared by every branch of one top-level
+    /// `expand_insert()` call. Bounded, unlike the depth/cycle guards, so a
+    /// wide nesting tree cannot expand without limit; see
+    /// [`MAX_EXPANDED_WIRES`]. Exceeding it truncates the remaining geometry
+    /// and sets `truncated` rather than aborting the whole expansion.
+    budget: &'a ExpansionBudget,
+}
+
+/// Shared total-expansion accounting for one top-level INSERT expansion.
+///
+/// `emit_wire` (leaf primitives) and each analyzed nested insert consume one
+/// unit; once `remaining` would go negative the expansion stops recursing and
+/// records that geometry was omitted. Interior-mutability so the immutably
+/// borrowed context can be threaded through the recursive walk.
+struct ExpansionBudget {
+    emitted: std::cell::Cell<usize>,
+    limit: usize,
+}
+
+impl ExpansionBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            emitted: std::cell::Cell::new(0),
+            limit,
+        }
+    }
+
+    /// Reserve one primitive. Returns `false` once the budget is exhausted.
+    fn charge(&self) -> bool {
+        self.charge_by(1)
+    }
+
+    /// Reserve `n` primitives at once (used when a value is known up front).
+    fn charge_by(&self, n: usize) -> bool {
+        let used = self.emitted.get();
+        if used.saturating_add(n) > self.limit {
+            // Saturate so a later caller still sees an exhausted budget.
+            self.emitted.set(self.limit);
+            return false;
+        }
+        self.emitted.set(used + n);
+        true
+    }
+
+    fn exhausted(&self) -> bool {
+        self.emitted.get() >= self.limit
+    }
 }
 
 fn nested_prototype_key(
@@ -1633,6 +1820,10 @@ struct Batches {
     by_style: HashMap<StyleKey, BatchEntry>,
     /// Batches that overflowed `MAX_POINTS_PER_BATCH` and have been closed.
     closed: Vec<BatchEntry>,
+    /// Set when the shared total-expansion budget stopped this assembly short,
+    /// so the caller can tell the user that geometry was omitted rather than
+    /// silently drawing less. See [`MAX_EXPANDED_WIRES`].
+    truncated: bool,
     /// Already-finalized wires that bypass the point batcher — currently the
     /// clipped output of an XCLIP'd nested insert, which is produced as whole
     /// WireModels by `clip_wires`. Appended verbatim at `finalize` (only their
@@ -1891,7 +2082,20 @@ fn expand_defn(
         eprintln!("block_cache: nested-block depth > {MAX_NESTING_DEPTH}, truncating");
         return;
     }
+    // Depth and cycle guards bound only *deep* or *self-referential* nesting.
+    // A wide-and-shallow tree (many sibling INSERTs, thousands of mutually
+    // referencing definitions, no cycle) passes both and still expands
+    // without limit — charge every primitive the walk actually emits against
+    // the shared total budget and stop cleanly once it is spent.
+    if ctx.budget.exhausted() {
+        out.truncated = true;
+        return;
+    }
     for sub in &defn.subs {
+        if ctx.budget.exhausted() {
+            out.truncated = true;
+            return;
+        }
         match sub {
             LocalSub::Wire(lw) => {
                 if suppress_root_points && lw.is_point {
@@ -1920,6 +2124,10 @@ fn expand_defn(
                     if !is_text && aabb_pixel_size(local, wpp) < MIN_PIXEL_SIZE {
                         continue;
                     }
+                }
+                if !ctx.budget.charge() {
+                    out.truncated = true;
+                    return;
                 }
                 emit_wire(lw, accum_xform, ctx, out, d_range);
             }
@@ -1958,11 +2166,16 @@ fn expand_defn(
                     world_per_pixel: ctx.world_per_pixel,
                     is_xref: ctx.is_xref,
                     bg_color: ctx.bg_color,
+                    budget: ctx.budget,
                 };
                 for offset in &nref.instance_offsets {
                     let attachment_transform = nested_attachment_transform(nref, *offset)
                         .then(accum_xform);
                     for attachment in &nref.attachments {
+                        if !ctx.budget.charge() {
+                            out.truncated = true;
+                            return;
+                        }
                         emit_wire(
                             attachment,
                             &attachment_transform,
@@ -2017,6 +2230,10 @@ fn expand_defn(
                 };
                 if nested_defn.inline_point_cost.is_some() && nref.clip_poly.is_none() {
                     for offset in &nref.instance_offsets {
+                        if ctx.budget.exhausted() {
+                            out.truncated = true;
+                            break;
+                        }
                         expand_defn(
                             nested_defn,
                             &composed_for(offset),
@@ -2040,6 +2257,10 @@ fn expand_defn(
                         .collect();
                     let mut first: Option<(Vec<WireModel>, [f64; 3])> = None;
                     for offset in &nref.instance_offsets {
+                        if ctx.budget.exhausted() {
+                            out.truncated = true;
+                            break;
+                        }
                         let composed = composed_for(offset);
                         let translation = transform_translation(&composed);
                         if let Some((source, source_translation)) = &first {
@@ -2048,6 +2269,10 @@ fn expand_defn(
                                 translation[1] - source_translation[1],
                                 translation[2] - source_translation[2],
                             ];
+                            if !ctx.budget.charge_by(source.len()) {
+                                out.truncated = true;
+                                break;
+                            }
                             out.extra_wires.extend(source.iter().map(|wire| {
                                 translated_prototype_wire(wire, "", delta)
                             }));
@@ -2064,6 +2289,9 @@ fn expand_defn(
                             nref.suppress_root_points,
                             nested_range,
                         );
+                        if sub.truncated {
+                            out.truncated = true;
+                        }
                         let mut wires = sub.finalize("", ctx.selected, ctx.bg_color);
                         let poly_delta = [
                             translation[0] - base_translation[0],
@@ -2089,6 +2317,10 @@ fn expand_defn(
                     }
                 } else {
                     for offset in &nref.instance_offsets {
+                        if ctx.budget.exhausted() {
+                            out.truncated = true;
+                            break;
+                        }
                         let composed = composed_for(offset);
                         let translation = transform_translation(&composed);
                         let key = nested_prototype_key(
@@ -2099,6 +2331,13 @@ fn expand_defn(
                             nref.suppress_root_points,
                         );
                         if let Some(cached) = out.nested_prototypes.get(&key).cloned() {
+                            // A prototype replay is a full re-emission of the
+                            // cached wires, so it costs the same budget as the
+                            // expansion that produced them.
+                            if !ctx.budget.charge_by(cached.wires.len()) {
+                                out.truncated = true;
+                                break;
+                            }
                             let delta = [
                                 translation[0] - cached.translation[0],
                                 translation[1] - cached.translation[1],
@@ -2128,6 +2367,9 @@ fn expand_defn(
                                 nref.suppress_root_points,
                                 nested_range,
                             );
+                            if sub.truncated {
+                                out.truncated = true;
+                            }
                             let mut wires = sub.finalize("", ctx.selected, ctx.bg_color);
                             for wire in &mut wires {
                                 if !is_standalone_analytical_curve(wire) && wire.render_instance.is_none() {
