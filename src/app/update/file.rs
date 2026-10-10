@@ -1359,9 +1359,6 @@ impl OpenCADStudio {
         self.shortcut_bindings
             .entry("F5".to_string())
             .or_insert_with(|| "ISOPLANE".to_string());
-        self.shortcut_bindings
-            .entry("SHIFT+TAB".to_string())
-            .or_insert_with(|| "DYNTABPREV".to_string());
     }
 
     /// Write the config only when it changed since the last write, so a toggle
@@ -1872,6 +1869,21 @@ impl OpenCADStudio {
                 crate::tf!(
                     "Warning: {} corrupt xref entities dropped",
                     caches.xref_dropped
+                )
+                .as_ref(),
+            );
+        }
+        // A deeply/ widely nested block set can expand past the total budget;
+        // the builder truncates rather than exhausting memory. Say so, so the
+        // user knows geometry was omitted instead of silently drawing less.
+        let expanded_truncated = crate::scene::cache::block_cache::take_expansion_truncated();
+        if expanded_truncated > 0 {
+            self.command_line.push_error(
+                crate::tf!(
+                    "Warning: {} block insert(s) exceeded the geometry expansion budget; \
+                     their outermost geometry was omitted. Use XREF or simplify nested blocks \
+                     to display them fully.",
+                    expanded_truncated
                 )
                 .as_ref(),
             );
