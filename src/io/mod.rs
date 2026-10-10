@@ -348,15 +348,16 @@ async fn open_path_with_phase_attempt(
         let t_purge = Instant::now();
         let dropped = purge_corrupt_entities(&mut doc);
         let purge_ms = t_purge.elapsed().as_millis() as u32;
-                if matches!(attempt, OpenAttempt::Strict) && dropped > 0 {
-                    return Err(OpenAttemptFailure {
-                        message: format!(
-                            "normal read found {dropped} structurally invalid drawing records"
-                        ),
-                        read_stats: Some(read_stats),
-                        recoverable: true,
-                    });
-                }
+                // `purge_corrupt_entities()` is a *repair* step: it returns how
+                // many records it removed, not how many are still broken. Running
+                // it identically on the strict and the recovery attempt means a
+                // hard failure here would refuse the file *because it was
+                // repaired*, and the offered retry could never yield a document
+                // the strict read did not already have. Report the count through
+                // the existing non-fatal path instead: it rides on
+                // `caches.corrupt_dropped` below, marks the file as repaired
+                // (`recovery_fingerprint_needed`), and is surfaced to the user as
+                // a command-line warning.
                 // Before the geometry is prepared below: completing the
                 // drawing's catalog linetypes (and repairing stripped ones)
                 // after it would leave the first view drawn without them.
