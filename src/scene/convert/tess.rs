@@ -33,6 +33,10 @@ pub(crate) struct ExpandedBlockObject {
     pub(crate) wires: Vec<WireModel>,
     style: BlockObjectStyle,
     is_xref: bool,
+    /// Set when the block's total-expansion budget cut its geometry short, so
+    /// the omission can be reported rather than silently drawing less. See
+    /// [`cache::block_cache::MAX_EXPANDED_WIRES`].
+    pub(crate) truncated: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -100,6 +104,7 @@ pub(crate) fn expand_block_object(
 ) -> ExpandedBlockObject {
     let style = block_object_style(document, insert, active_viewport, bg_color);
     let fallback_depths = rustc_hash::FxHashMap::default();
+    let mut truncated = false;
     let fallback_cache;
     let cache = match block_cache {
         Some(cache) if cache.defn(&insert.block_name).is_some() => cache,
@@ -122,7 +127,7 @@ pub(crate) fn expand_block_object(
         .get(&insert.block_name)
         .map(|record| record.flags.is_xref || record.flags.is_xref_overlay)
         .unwrap_or(false);
-    let mut wires = cache::block_cache::expand_insert(
+    let mut wires = cache::block_cache::expand_insert_budgeted(
         document,
         cache,
         insert,
@@ -145,6 +150,10 @@ pub(crate) fn expand_block_object(
         options.scale_policy,
         options.suppress_root_points,
     )
+    .map(|expanded| {
+        truncated = expanded.truncated;
+        expanded.wires
+    })
     .unwrap_or_default();
 
     if options.apply_xclip {
@@ -189,6 +198,7 @@ pub(crate) fn expand_block_object(
         wires,
         style,
         is_xref,
+        truncated,
     }
 }
 
